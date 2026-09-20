@@ -1,0 +1,607 @@
+ТЕХНИЧЕСКОЕ ЗАДАНИЕ
+Мультиагентная системанейроозвучки художественных книг
+ElevenLabs-first архитектура
+Версия 2.019 сентября 2026
+Основной принцип. LLM понимает и режиссирует; ElevenLabs исполняет; база данных хранит идентичность персонажей и голосов; оркестратор управляет процессом; QC проверяет результат.
+
+
+0. Резюме проекта
+Цель. Создать систему, которая принимает художественную книгу и автоматически формирует многоголосую аудиокнигу с постоянными голосами персонажей, эмоциональной режиссурой, корректным определением говорящего, контролем произношения и автоматической проверкой качества.
+Ключевое архитектурное решение. ElevenLabs используется как основной speech-движок: Voice Design v3 — для кастинга и создания персонажных голосов; Eleven v3 Text-to-Dialogue — для многоголосых сцен; обычный Eleven v3 / Multilingual v2 — для одиночных реплик и повествования там, где это даёт лучший результат. Вся бизнес-логика остаётся независимой от провайдера через TTSAdapter.
+Слой
+Ответственность
+Рекомендуемая реализация
+Понимание книги
+Персонажи, связи, говорящие, контекст
+LLM-агенты
+Кастинг
+Описание и фиксация постоянного голоса
+Casting Director + ElevenLabs Voice Design
+Режиссура
+Эмоции, манера, аудио-теги, темп
+Scene Director
+Озвучка
+Синтез речи и диалогов
+ElevenLabs-first TTS Adapter
+Проверка
+ASR, speaker identity, акустические ошибки
+QC pipeline + Review Agent
+Монтаж
+Паузы, уровни, главы, M4B
+FFmpeg / аудиосервис
+Память
+Character Bible, voice_id, события, версии
+PostgreSQL + Object Storage
+
+Не делать. Не строить систему как свободный чат нескольких агентов и не давать TTS заново «придумывать» голос в каждой сцене. Все решения фиксируются структурированными сущностями и версиями.
+
+Содержание
+1. Цели, границы и пользовательский сценарий
+15. Workflow и состояния
+2. Архитектурные принципы
+16. Хранилища и схема БД
+3. ElevenLabs-first стратегия
+17. API и интерфейсы
+4. Компонентная архитектура
+18. UI/UX
+5. Модель данных книги
+19. Наблюдаемость, стоимость и безопасность
+6. Агенты и их контракты
+20. Тестирование и метрики
+7. Character Bible и continuity
+21. MVP и этапы реализации
+8. Кастинг и Voice Registry
+22. Критерии приёмки
+9. Scene Director и Performance Plan
+23. Риски и решения
+10. Pronunciation pipeline
+Приложение A. JSON-контракты
+11. ElevenLabs Adapter и маршрутизация
+Приложение B. Структура проекта
+12. Сегментация и Text-to-Dialogue
+Приложение C. Edge cases
+13. Quality Control и перегенерация
+Приложение D. Актуальные допущения ElevenLabs и источники
+14. Аудиомонтаж и экспорт
+
+
+1. Цели, границы и пользовательский сценарий
+1.1. Цель продукта
+Преобразование EPUB/FB2/TXT в полноценную многоголосую аудиокнигу.
+Отдельный постоянный голос рассказчика и постоянные голоса персонажей.
+Автоматическое определение говорящего, пола/возрастной категории и речевого профиля без выдумывания неизвестных фактов.
+Художественная режиссура реплик с учётом текущей сцены и скрытого/выраженного эмоционального состояния.
+Корректное произношение имён, омографов, аббревиатур, чисел и иностранных терминов.
+Автоматический контроль качества и точечная перегенерация без повторной генерации всей книги.
+Экспорт по главам и единым M4B-файлом.
+1.2. Основной пользовательский поток
+Пользователь загружает книгу.
+Система извлекает структуру и анализирует персонажей.
+Пользователь просматривает Character Bible и исправляет неоднозначности при необходимости.
+Casting Director формирует voice brief; ElevenLabs Voice Design создаёт несколько кандидатов.
+Пользователь или автоматический audition-модуль выбирает голос; voice_id фиксируется (LOCK).
+Генерируется одна-две тестовые сцены, после чего пользователь утверждает стиль.
+Система режиссирует и озвучивает книгу по сценам/блокам.
+QC проверяет текстовую точность, идентичность голоса и акустическое качество; неудачные сегменты перегенерируются.
+Audio Engine собирает главы и финальный M4B.
+1.3. Вне scope первой версии
+OCR сканов как часть основного pipeline — допускается отдельный preprocessing-модуль.
+Автоматическая публикация книги в коммерческих магазинах.
+Музыкальное оформление и саунд-дизайн уровня радиоспектакля.
+Клонирование голоса реального человека без подтверждённых прав/согласия.
+2. Архитектурные принципы
+Принцип
+Требование
+Structured first
+Агенты возвращают JSON по схеме, а не свободный текст.
+Persistent memory
+Character Bible, voice_id и события живут в БД, а не только в контексте LLM.
+Voice lock
+После утверждения голос персонажа не меняется автоматически.
+Human override
+Любое художественное решение можно поправить вручную на уровне реплики/сцены/персонажа.
+Provider abstraction
+Вся логика выше TTS работает через единый TTSAdapter.
+Idempotency
+Повторный запуск не должен повторно генерировать неизменившиеся сегменты.
+Traceability
+Для каждого аудиофрагмента хранится полная трассировка: текст, модель, voice_id, настройки, seed, версия prompt.
+Fail safe
+Неоднозначность маркируется unknown/review, а не заполняется выдуманным значением.
+
+Ключевая граница ответственности. LLM отвечает за интерпретацию; ElevenLabs — за исполнение; код — за состояние, ограничения, очереди, retries, кэш и валидацию.
+
+3. ElevenLabs-first стратегия
+3.1. Почему ElevenLabs — основной backend
+Voice Design v3 позволяет создавать голос из текстового описания, включая возраст, пол, акцент, тон, темп и стиль; один запрос формирует три preview-кандидата.
+Созданные Voice Design v3 голоса совместимы с Eleven v3 и audio tags.
+Eleven v3 поддерживает эмоциональные/режиссёрские audio tags и natural multi-speaker dialogue.
+Text-to-Dialogue позволяет передавать последовательность реплик разных voice_id в одном запросе, сохраняя контекст разговора.
+Русский поддерживается Eleven v3.
+3.2. Ограничения, которые сразу учитываются в проекте
+Ограничение
+Архитектурная реакция
+Text-to-Dialogue рекомендуется держать ≤ 2000 символов суммарно
+Диалоги режутся по смысловым мини-сценам, а не по фиксированному числу символов.
+Генерация недетерминирована
+Сохранять seed, параметры и лучший получившийся audio artifact; QC + controlled retry.
+Eleven v3 не использует SSML break tags
+Паузы задавать контекстом, пунктуацией/audio tags; точные межсегментные паузы добавляет Audio Engine.
+Voice Design experimental
+Всегда проводить audition на нескольких типах реплик и фиксировать только прошедший голос.
+PVC и Eleven v3 имеют ограничения совместимости
+Для v3-персонажей в базовой архитектуре использовать Voice Design / совместимые voices; PVC не делать обязательным механизмом.
+Default voices могут меняться/исчезать
+Не строить ключевой каст на нестабильных default voice assumptions; хранить provider voice metadata и проверять доступность.
+
+4. Компонентная архитектура
+BOOK FILE  |  vDocument Parser --> Structural Segmenter  |  vBook Analyst --> Character Bible / Story Memory  |  vSpeaker Attribution --> Continuity Validator  |  vCasting Director --> ElevenLabs Voice Design --> Voice Registry (LOCKED)  |  vScene Director --> Pronunciation Resolver --> Performance Plan  |  vElevenLabs Adapter --> TTS / Text-to-Dialogue  |  vASR + Speaker QC + Acoustic QC --> Review Agent --> retry/fallback  |  vAudio Engine --> Chapters --> M4B / MP3 / WAV
+4.1. Что является агентом
+Агент
+Роль
+Book Analyst
+Глобальная модель книги, сущности и связи.
+Speaker Attribution Agent
+Определяет говорящего для каждой реплики.
+Character & Continuity Agent
+Entity resolution и непрерывность характеристик.
+Casting Director
+Формирует voice brief и управляет кастингом.
+Scene Director
+Определяет подачу конкретной сцены/реплики.
+Pronunciation Agent
+Разрешает контекстное произношение и словарь.
+Quality Review Agent
+Интерпретирует метрики QC и формирует controlled retry instruction.
+
+4.2. Что агентом НЕ является
+Parser
+Segmenter
+TTS Adapter
+Очередь задач
+Кэш
+ASR
+Speaker encoder
+Audio Engine
+Exporter
+База данных
+Мониторинг
+5. Модель данных книги
+BOOK  CHAPTER    SCENE      PARAGRAPH        UTTERANCE          speaker_id          text_original          text_normalized          performance_plan          audio_segment
+5.1. Идентификаторы
+Все сущности получают стабильный UUID/внутренний ID сразу после парсинга.
+Исходный текст не перезаписывается: любые нормализации хранятся отдельно.
+Любой сгенерированный audio segment должен ссылаться на конкретный utterance_id.
+5.2. Speaker types
+Тип
+Пример обработки
+NARRATOR
+Базовый narration voice.
+CHARACTER
+Постоянный character voice_id.
+INNER_THOUGHT
+Тот же voice_id, другая режиссура/постобработка.
+LETTER / DIARY
+Может читаться персонажем или рассказчиком согласно контексту.
+PHONE / RADIO / ANNOUNCEMENT
+Голос персонажа + опциональный безопасный постэффект.
+GROUP
+Особая маркировка; может требовать отдельного synthetic voice или narration.
+UNKNOWN
+Не генерировать автоматически ниже порога confidence без повторного анализа/ручной проверки.
+
+6. Агенты и их контракты
+6.1. Book Analyst
+Выделяет персонажей, aliases, отношения, социальные роли, пол/возрастную категорию при наличии доказательств.
+Формирует chapter/scene summaries и глобальную story memory.
+Не назначает voice_id и не управляет TTS.
+Каждый inferred-факт хранит confidence и evidence references.
+{  "character_id": "char_007",  "canonical_name": "Анна Сергеевна",  "aliases": ["Анна", "Аня"],  "gender": {"value": "female", "confidence": 0.99},  "age_band": {"value": "25-30", "confidence": 0.72},  "personality": ["reserved", "intelligent", "anxious"],  "evidence": ["ch03_p18", "ch04_p07"]}
+6.2. Speaker Attribution Agent
+Получает current scene + ближайший контекст + список доступных character_id.
+Не имеет права создавать новый character_id без отдельного entity-resolution шага.
+Возвращает speaker_id, confidence, evidence и reason_code.
+Низкий confidence запускает second-pass или manual review.
+Confidence
+Действие
+≥ 0.90
+Автоподтверждение, если нет конфликтующих сигналов.
+0.70–0.89
+Second-pass + Continuity check.
+< 0.70
+Manual review либо расширенный контекст.
+
+Пороговые значения стартовые и должны быть откалиброваны на реальном корпусе.
+6.3. Character & Continuity Agent
+Объединяет aliases и предотвращает дубли персонажей.
+Следит за сохранностью пола, роли, voice_id и базового speech profile.
+Учитывает flashback/aging как явные временные состояния, а не как создание нового персонажа.
+Не меняет LOCKED voice без explicit change request.
+6.4. Casting Director
+Преобразует Character Bible в provider-neutral Voice Brief.
+Формирует ElevenLabs Voice Design prompt и audition pack.
+Запрашивает три preview-кандидата через Voice Design.
+Сравнивает кандидатов по character fit, разборчивости, выразительности и различимости с уже утверждёнными персонажами.
+После выбора сохраняет voice_id и блокирует автоматическую замену.
+6.5. Scene Director
+Определяет не «эмоцию героя вообще», а подачу конкретной реплики.
+Разделяет internal_state и expressed_state.
+Определяет intent, primary/secondary emotion, intensity, tempo, delivery notes, допустимые Eleven v3 audio tags.
+Работает на уровне сцены, а не изолированной строки.
+6.6. Pronunciation Agent
+Создаёт контекстный pronunciation dictionary.
+Разрешает омографы, имена, топонимы, иностранные слова, аббревиатуры, даты и числа.
+Для Eleven v3 допускает IPA-подход там, где он поддерживается; точный способ должен находиться внутри ElevenLabs Adapter, а не в бизнес-логике.
+Не выполняет глобальные replace без проверки контекста.
+6.7. Quality Review Agent
+Получает числовые QC-метрики и контекст только для спорных сегментов.
+Не слушает/перегенерирует всё подряд без причины.
+Формирует одну из команд: PASS / RETRY_SAME / RETRY_DIRECTED / MANUAL_REVIEW / FALLBACK_BACKEND.
+7. Character Bible и continuity
+7.1. Постоянные и временные свойства
+Постоянные
+Временные
+canonical identity
+текущая усталость
+aliases
+страх/гнев/радость в сцене
+baseline voice profile
+ранение/опьянение/шёпот
+базовый стиль речи
+маскировка эмоции
+основные отношения
+актуальное знание/секрет
+
+7.2. Event memory
+{  "event_id": "ev_0042",  "scene_id": "sc_018",  "participants": ["char_anna", "char_mikhail"],  "summary": "Анна узнаёт, что Михаил солгал.",  "state_updates": {    "char_anna": {"trust_mikhail": -0.6, "anger": 0.5}  }}
+8. Кастинг и Voice Registry
+8.1. Voice Brief
+{  "character_id": "char_mikhail",  "language": "ru",  "age_presentation": "50-60",  "gender_presentation": "male",  "timbre": "low, slightly rough",  "pacing": "slow, deliberate",  "baseline_delivery": "restrained, authoritative",  "avoid": ["caricature", "excessive growl", "very theatrical"]}
+8.2. Audition pack
+Нейтральная фраза.
+Длинный повествовательный/логический фрагмент.
+Тихая эмоциональная реплика.
+Гнев или повышенная интенсивность.
+Шёпот/сдержанная речь, если персонажу это необходимо.
+Русские имена и сложные сочетания звуков.
+8.3. Voice lock
+{  "voice_id_internal": "book01_char007_v1",  "provider": "elevenlabs",  "provider_voice_id": "...",  "voice_source": "voice_design_v3",  "status": "LOCKED",  "audition_version": 2,  "approved_at": "2026-09-19T..."}
+Запрещено. Повторно вызывать Voice Design для того же персонажа при каждой главе. Voice Design используется как кастинг, а не как генерация каждой реплики.
+
+9. Scene Director и Performance Plan
+9.1. Вход Scene Director
+Scene summary и предыдущий scene summary.
+Последние несколько реплик текущего диалога.
+Character Bible только участвующих персонажей.
+Relevant event memory.
+Текущее состояние персонажей.
+Оригинальный текст, который нельзя смыслово переписывать.
+9.2. Выход
+{  "utterance_id": "u_124",  "speaker_id": "char_anna",  "voice_id": "book01_char007_v1",  "emotion": {    "internal": {"fear": 0.85, "anger": 0.55},    "expressed": {"fear": 0.25, "anger": 0.45}  },  "intent": "force_mikhail_to_leave",  "delivery": "quiet at first; control breaks slightly at the end",  "audio_tags": ["whispers"],  "pause_before_ms": 250,  "pause_after_ms": 700,  "text": "Уходи отсюда."}
+audio_tags должны проходить allow-list/validation в ElevenLabs Adapter. Агент не может бесконтрольно придумывать provider-specific синтаксис.
+10. Pronunciation pipeline
+Проблема
+Решение
+Омограф
+Контекстная disambiguation: за́мок / замо́к.
+Имя/топоним
+Canonical pronunciation entry + evidence.
+Иностранное слово
+Язык/произношение определяется отдельно; не транслитерировать вслепую.
+Аббревиатура
+Разворачивать или произносить по буквам по контексту.
+Число/дата
+Нормализовать в естественную словесную форму с учётом падежа, когда возможно.
+Сокращение
+Контекстно раскрывать только безопасные и известные сокращения.
+
+pronunciation_dictionary  key: lexical_form + context_signature  value:    normalized_spoken_form    ipa_if_used    language    confidence    approved_by    version
+11. ElevenLabs Adapter и маршрутизация
+11.1. Единый интерфейс
+class TTSAdapter:    design_voice(voice_brief, audition_text) -> VoiceCandidates    synthesize_single(utterance, voice, performance) -> AudioArtifact    synthesize_dialogue(dialogue_block, voices, performance) -> AudioArtifact    get_voice_metadata(provider_voice_id) -> VoiceMetadata    healthcheck() -> HealthStatus
+11.2. Рекомендуемая маршрутизация
+Контент
+Основной режим
+Причина
+Диалог 2+ персонажей
+Eleven v3 Text-to-Dialogue
+Контекстная многоголосая сцена.
+Одиночная эмоциональная реплика
+Eleven v3 TTS
+Audio tags и expressive delivery.
+Длинное спокойное повествование
+A/B: Eleven v3 vs Multilingual v2
+Выбрать по стабильности на русском long-form.
+Служебное превью/быстрый тест
+Быстрый совместимый режим
+Экономия ресурсов, не финальный master.
+
+11.3. Provider-neutral параметры
+Не хранить бизнес-логику в терминах только stability/style/similarity_boost.
+Performance Plan остаётся семантическим; adapter переводит его в audio tags, voice settings и формат запроса.
+Все фактические provider parameters сохраняются в GenerationRecord для воспроизводимости.
+12. Сегментация и Text-to-Dialogue
+12.1. Блок диалога
+Граница формируется по смыслу и сцене.
+Целевой суммарный объём inputs[].text — не более ~2000 символов на запрос Text-to-Dialogue.
+Не разрывать эмоциональный обмен посреди пары вопрос–ответ без необходимости.
+При большом диалоге создавать последовательность dialogue_block_N и сохранять переходное состояние.
+dialogue_block_014  context_before: short summary  lines:    1. speaker=anna, voice_id=...    2. speaker=mikhail, voice_id=...    3. speaker=anna, voice_id=...  total_text_chars <= target_limit  seed = stored  output -> audio_artifact
+12.2. Narration между репликами
+Нужно benchmark-решение: либо включать короткие narrator-вставки в один dialogue request с narrator voice_id, либо генерировать их отдельно. Выбор определяется A/B-тестом плавности переходов. Архитектура должна поддерживать оба режима.
+13. Quality Control и перегенерация
+13.1. Обязательные QC-слои
+Слой
+Проверка
+Пример метрики
+Text fidelity
+Пропуски/повторы/искажения
+WER, CER, semantic diff
+Speaker identity
+Сохранён ли тембр персонажа
+speaker embedding similarity
+Acoustic
+Clipping, тишина, артефакты
+peak, RMS/LUFS, silence ratio
+Duration anomaly
+Необычная длина
+duration / expected
+Continuity
+Голос/подача не «скачут»
+межсегментные признаки
+Human review sample
+Субъективная естественность
+MOS-like rubric
+
+13.2. ASR round-trip
+intended text    |ElevenLabs audio    |ASR transcript    |normalized comparison    |PASS / RETRY / REVIEW
+13.3. Retry policy
+Попытка
+Изменение
+1
+Исходный план и seed.
+2
+Новый seed при тех же смысловых параметрах.
+3
+Quality Review Agent уточняет delivery/audio tags.
+4
+Разбить блок на меньшие части либо изменить режим single/dialogue.
+5
+Manual review или fallback backend — только если он подключён и совместим по voice identity.
+
+Важно. Удачный audio artifact никогда не перегенерируется без изменения входных данных или явного запроса. Генеративная недетерминированность делает сохранение лучшего результата обязательным.
+
+14. Аудиомонтаж и экспорт
+Master storage в WAV/FLAC; пользовательский экспорт MP3 и M4B.
+Паузы между независимыми сегментами добавляет Audio Engine в миллисекундах.
+Не выравнивать whisper/shout до одинакового мгновенного уровня; loudness normalization выполняется с сохранением художественной динамики.
+Chapter markers, author/title/cover metadata включаются в M4B.
+Точечная регенерация заменяет только соответствующий segment и пересобирает затронутую главу/финальный контейнер.
+15. Workflow и состояния
+BOOK STATUSUPLOADED -> PARSED -> ANALYZED -> CASTING -> CAST_LOCKED-> DIRECTING -> SYNTHESIZING -> QC -> MASTERING -> COMPLETED                                         \-> FAILED/REVIEW
+SEGMENT STATUSPENDING -> DIRECTED -> QUEUED -> GENERATED -> QC_PASS -> APPROVED                                  \-> QC_FAIL -> RETRY -> ...
+15.1. Требования workflow engine
+Resumable после рестарта приложения/worker.
+Idempotency keys для TTS jobs.
+Rate-limit aware очередь ElevenLabs.
+Dead-letter queue для ошибок, превышающих retry policy.
+Priority queue для ручной точечной регенерации.
+16. Хранилища и схема БД
+Хранилище
+Что хранить
+PostgreSQL
+books, chapters, scenes, utterances, characters, aliases, relationships, character_states, voices, generation_records, qc_results, prompt_versions, jobs.
+S3/MinIO
+Исходники, voice previews, reference audio, raw segments, chapter masters, final exports.
+Redis
+Очереди/locks/cache/transient rate-limit state.
+
+16.1. Минимальные таблицы
+bookschaptersscenesparagraphsutterancescharacterscharacter_aliasescharacter_relationshipscharacter_statesvoice_profilesvoice_registryperformance_planspronunciation_entriesgeneration_recordsqc_resultsjobsprompt_versions
+17. API и интерфейсы
+17.1. Внутренние API (пример)
+POST /booksPOST /books/{id}/analyzeGET  /books/{id}/charactersPATCH /characters/{id}POST /characters/{id}/voice-candidatesPOST /characters/{id}/voice-lockPOST /scenes/{id}/directPOST /scenes/{id}/generate-previewPOST /books/{id}/generatePOST /utterances/{id}/regenerateGET  /jobs/{id}POST /books/{id}/export
+17.2. Provider API isolation
+Клиент ElevenLabs находится только внутри provider-модуля. Остальные сервисы не должны импортировать ElevenLabs SDK напрямую. Это позволяет заменить API без переписывания Character Bible, Scene Director и QC.
+18. UI/UX
+Экран
+Функции
+Book
+Upload, структура глав, прогресс.
+Characters
+Имя, aliases, пол, возрастная группа, роль, confidence, voice status.
+Casting
+Voice brief, три previews, audition, regenerate, LOCK.
+Scene preview
+Текст сцены, speaker mapping, performance plan, аудиоплеер.
+Generation
+Очередь, прогресс по главам, ошибки, cost counters.
+QC
+Проблемные сегменты, причина fail, сравнение A/B.
+Export
+MP3 chapters, M4B, WAV/FLAC master.
+
+18.1. Manual override
+speaker_id
+voice_id
+pronunciation
+emotion/delivery
+audio tags
+режим single/dialogue
+точечная перегенерация
+ручное approve QC
+19. Наблюдаемость, стоимость и безопасность
+19.1. Observability
+Количество TTS-запросов, символов и длительность сгенерированного аудио.
+Retry rate и QC failure rate.
+Доля manual review.
+Среднее время обработки сцены и очереди.
+Provider errors / rate-limit errors.
+Стоимость по книге и по персонажу/сцене, если provider API возвращает достаточные данные.
+19.2. Безопасность ключей и данных
+API-ключ ElevenLabs хранить в secret manager/env, не в БД и не в логах.
+Не логировать полный provider request с секретами.
+Voice reference files защищать как пользовательские данные.
+Клонированные реальные голоса разрешать только с подтверждённым правом использования.
+В Voice Registry хранить provenance: designed / library / licensed / consented_clone.
+19.3. Авторские права
+Приложение должно предупреждать, что наличие технической возможности озвучить текст не означает наличие прав на распространение полученной аудиокниги. Для коммерческого использования необходимы соответствующие права на исходное произведение и используемые голоса.
+20. Тестирование и метрики
+20.1. Benchmark corpus
+Категория
+Минимальный объём
+Narration
+50 фрагментов
+Мужские диалоги
+50
+Женские диалоги
+50
+Смешанные сцены
+50
+Шёпот/тихая речь
+20
+Гнев/повышенная интенсивность
+20
+Имена/омографы
+30
+Длинные фразы
+20
+Много персонажей
+15 сцен
+
+20.2. Метрики
+Speaker Attribution Accuracy / Macro F1.
+Entity Resolution precision/recall.
+WER/CER после TTS→ASR.
+Speaker similarity и cross-character collision rate.
+QC retry rate.
+Manual intervention rate.
+Human MOS-like: naturalness, character fit, emotion fit, pronunciation, consistency, listening fatigue.
+20.3. A/B для narration
+Отдельно сравнить Eleven v3 и Multilingual v2 на русском длинном повествовании. Не закреплять модель для рассказчика до слепого прослушивания корпуса: expressive диалоги и стабильный long-form narration — разные задачи.
+21. MVP и этапы реализации
+Этап
+Содержание
+Результат
+MVP-0
+Parser + ручной speaker/voice + ElevenLabs TTS
+Проверка качества русского TTS и монтажа.
+MVP-1
+Speaker Attribution + Character Bible + Scene Director + manual casting
+10–20 минут многоголосой сцены end-to-end.
+MVP-2
+Casting Director + Voice Design + Voice Registry + preview/lock
+Автоматизированный кастинг.
+MVP-3
+Text-to-Dialogue chunking + ASR QC + retries
+Стабильная генерация главы.
+MVP-4
+UI + M4B + resumable jobs + metrics
+Полная книга одним workflow.
+Production
+Multi-user, quotas, rate limits, provider failover, backups
+Эксплуатационная версия.
+
+Первый реальный тест. Одна книга, 3–5 ключевых персонажей, рассказчик, 3–5 разноплановых сцен. Сначала доказать качество 10–15 минут, затем масштабировать на десятки часов.
+
+22. Критерии приёмки
+1. EPUB/FB2/TXT успешно импортируется без потери глав и абзацев.
+2. Система формирует редактируемый Character Bible.
+3. Speaker attribution работает с confidence и review path.
+4. Для персонажа можно получить 3 Voice Design preview и зафиксировать выбранный voice_id.
+5. После LOCK один персонаж использует один и тот же voice_id во всех последующих генерациях.
+6. Система генерирует preview сцены до запуска полной книги.
+7. Поддерживается Eleven v3 Text-to-Dialogue для многоголосого блока.
+8. Суммарный размер dialogue request контролируется и не превышает configured safe limit.
+9. Каждый audio segment имеет GenerationRecord.
+10. ASR QC выявляет явные пропуски/повторы и отправляет сегмент на controlled retry.
+11. Поддерживается точечная перегенерация utterance/scene/chapter.
+12. Процесс возобновляется после рестарта без потери утверждённых сегментов.
+13. Финальный экспорт формирует MP3 по главам и M4B с метаданными.
+14. Пользователь может вручную исправить speaker, voice, pronunciation и delivery.
+23. Риски и решения
+Риск
+Следствие
+Митигация
+Недетерминированный TTS
+Разные результаты при повторе
+Seed + сохранение лучшего артефакта + QC.
+Voice drift
+Персонаж звучит иначе
+LOCK provider voice_id + speaker-embedding QC.
+Похожие голоса персонажей
+Путается восприятие
+Collision check на этапе кастинга.
+Ошибочный speaker
+Реплика озвучена не тем голосом
+Confidence + continuity + manual review.
+Voice Design неудачен
+Голос красив, но плохо играет эмоции
+Многостильный audition pack до LOCK.
+Слишком длинный dialogue request
+Артефакты/нестабильность
+Semantic chunking ≤ configured provider limit.
+Плохое произношение
+Раздражает слушателя
+Pronunciation dictionary + контекстный resolver + regression tests.
+Изменение API/моделей ElevenLabs
+Поломка pipeline
+TTSAdapter + pinned provider config + integration tests.
+Рост стоимости
+Дорогая длинная книга
+Кэш, отсутствие лишних retries, preview до full generation, cost telemetry.
+Потеря API-доступа
+Остановка синтеза
+Очередь/resume; в будущем локальный fallback backend.
+
+Приложение A. JSON-контракты
+A.1. Character
+{  "character_id": "char_007",  "canonical_name": "Анна",  "aliases": ["Аня"],  "gender": {"value": "female", "confidence": 0.99},  "age_band": {"value": "25-30", "confidence": 0.74},  "role": "main",  "baseline_traits": ["reserved", "intelligent"],  "speech_profile": {    "tempo": "medium",    "formality": "high",    "expressiveness": "restrained"  },  "voice_registry_id": "book01_char007_v1"}
+A.2. Utterance
+{  "utterance_id": "u_124",  "scene_id": "sc_018",  "source_text": "— Уходи отсюда!",  "spoken_text": "Уходи отсюда!",  "speaker_id": "char_007",  "speaker_confidence": 0.96,  "type": "CHARACTER"}
+A.3. PerformancePlan
+{  "utterance_id": "u_124",  "intent": "force_other_to_leave",  "emotion_internal": {"fear": 0.8, "anger": 0.6},  "emotion_expressed": {"fear": 0.2, "anger": 0.5},  "delivery": "controlled at first; breaks slightly at end",  "allowed_audio_tags": ["whispers"],  "pause_before_ms": 250,  "pause_after_ms": 700}
+A.4. GenerationRecord
+{  "generation_id": "gen_...",  "utterance_ids": ["u_124", "u_125"],  "provider": "elevenlabs",  "mode": "text_to_dialogue",  "model_id": "eleven_v3",  "provider_voice_ids": ["...", "..."],  "seed": 123456,  "provider_parameters": {},  "prompt_version": "scene_director_v7",  "attempt": 2,  "audio_uri": "s3://...",  "qc_status": "PASS"}
+Приложение B. Рекомендуемая структура проекта
+app/  api/    books.py    characters.py    casting.py    generation.py  agents/    book_analyst.py    speaker_attribution.py    continuity.py    casting_director.py    scene_director.py    pronunciation.py    quality_review.py  domain/    models.py    schemas.py    enums.py  parsers/    epub.py    fb2.py    txt.py  providers/    base_tts.py    elevenlabs_adapter.py    fallback_adapter.py  services/    segmenter.py    voice_registry.py    pronunciation_registry.py    generation_orchestrator.py    qc_asr.py    qc_speaker.py    qc_acoustic.py    audio_engine.py    exporter.py  repositories/    books.py    characters.py    generations.py  workers/    llm_worker.py    tts_worker.py    qc_worker.py    audio_worker.py  prompts/    book_analyst_v1.txt    speaker_attribution_v1.txt    casting_director_v1.txt    scene_director_v1.txt  tests/  migrations/
+Приложение C. Edge cases для обязательного тестирования
+Диалог без явных ремарок «сказал/ответила».
+Диалог 4–6 персонажей.
+Одинаковые имена и фамилии.
+Псевдоним/тайная личность.
+Персонаж цитирует другого персонажа.
+Внутренняя речь внутри абзаца рассказчика.
+Письмо, дневник, SMS, объявление, радио, телефон.
+Flashback с более молодым вариантом персонажа.
+Намеренная смена/маскировка голоса внутри сюжета.
+Сарказм, suppressed anger, fake happiness.
+Шёпот, плач, смех, вздох — без превращения в карикатуру.
+Длинные предложения и авторская пунктуация.
+Омографы русского языка.
+Иностранные имена и смешение языков.
+Числа, годы, римские цифры, единицы измерения.
+Тире/кавычки внутри реплики.
+Технический сбой API в середине главы.
+Повтор запуска той же книги после 70% выполнения.
+Ручная смена voice после уже сгенерированных глав — система должна явно предложить область регенерации, а не смешать два голоса.
+Приложение D. Актуальные допущения ElevenLabs и источники
+Факты ниже проверены по официальной документации ElevenLabs на 19.09.2026. Так как API и модели меняются, эти ограничения должны быть вынесены в конфигурацию и повторно проверяться перед production-релизом.
+Voice Design: Voice Design генерирует три preview; поддерживает описание возраста, пола, акцента, тона, темпа и стиля; Voice Design v3 совместим с Eleven v3. Также отмечено, что Voice Design остаётся experimental. https://elevenlabs.io/docs/eleven-creative/voices/voice-design
+Text to Dialogue: Eleven v3; multi-speaker; рекомендуется ≤2000 символов суммарно в inputs[].text на запрос; output недетерминирован, seed повышает стабильность. https://elevenlabs.io/docs/overview/capabilities/text-to-dialogue
+Text to Speech / Eleven v3: Eleven v3 поддерживает audio tags для эмоций/манеры/реакций и 70+ языков, включая русский; v3 не поддерживает SSML break tags. https://elevenlabs.io/docs/eleven-creative/playground/text-to-speech
+Voices overview: Voice Library, Voice Design, cloning и языки; Generated Voices подходят для character/storytelling. Документация также предупреждает об изменениях default voices. https://elevenlabs.io/docs/overview/capabilities/voices
+Voice settings API: Provider settings включают stability, similarity_boost, style, speed и speaker boost; их следует хранить в GenerationRecord, но не делать частью provider-neutral доменной модели. https://elevenlabs.io/docs/api-reference/voices/settings/update
+Конфигурационное требование. provider_limits.json должен содержать лимиты и feature flags ElevenLabs, чтобы изменение документации не требовало переписывания доменной логики.
+
+Итоговые архитектурные решения
+1. ElevenLabs — основной TTS provider; система остаётся provider-agnostic выше уровня adapter.
+2. Voice Design — инструмент Casting Director, а не механизм генерации каждой реплики.
+3. Каждый утверждённый персонаж получает LOCKED voice_id.
+4. Eleven v3 Text-to-Dialogue — основной режим для коротких многоголосых сцен; блоки режутся семантически и контролируются по размеру.
+5. Scene Director формирует provider-neutral Performance Plan; ElevenLabs Adapter переводит его в допустимые audio tags/settings.
+6. Точный контроль пауз между сегментами выполняет Audio Engine; не полагаться на SSML break в Eleven v3.
+7. QC состоит минимум из ASR round-trip, speaker consistency и acoustic checks.
+8. Удачные результаты кэшируются и никогда не перегенерируются автоматически без необходимости.
+9. Перед full-book generation обязательны casting audition и preview нескольких сцен.
+10. MVP строится по вертикальному срезу от книги до 10–15 минут готового аудио, после чего система масштабируется.

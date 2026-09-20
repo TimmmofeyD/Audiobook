@@ -1,0 +1,9 @@
+[project]
+name = "litera-audiobook-studio"
+version = "0.1.0"
+description = "Local ElevenLabs-first audiobook production studio"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

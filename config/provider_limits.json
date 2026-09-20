@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "verified_on": "2026-09-19",
+  "provider": "elevenlabs",
+  "base_url": "https://api.elevenlabs.io/v1",
+  "design_model": "eleven_ttv_v3",
+  "dialogue_model": "eleven_v3",
+  "asr_model": "scribe_v2",
+  "output_format": "mp3_44100_128",
+  "single_chars": 4500,
+  "dialogue_chars": 2000,
+  "dialogue_voices": 10,
+  "design_description_min": 20,
+  "design_description_max": 1000,
+  "design_text_min": 100,
+  "design_text_max": 1000,
+  "request_timeout_seconds": 180,
+  "retries": 2,
+  "max_retry_wait_seconds": 30,
+  "features": {"voice_design": true, "dialogue": true, "asr": true, "ssml_breaks": false},
+  "models": ["eleven_v3", "eleven_multilingual_v2"],
+  "audio_tags": ["whispers", "whispering", "shouts", "shouting", "laughs", "laughing", "sighs", "sighing", "crying", "giggling", "curious", "excited", "sarcastic", "angry", "sad", "happy", "nervous", "calm", "serious", "hesitant", "thoughtful"],
+  "sources": [
+    "https://elevenlabs.io/docs/api-reference/text-to-voice/design",
+    "https://elevenlabs.io/docs/api-reference/text-to-voice/create",
+    "https://elevenlabs.io/docs/api-reference/text-to-dialogue/convert",
+    "https://elevenlabs.io/docs/api-reference/text-to-speech/convert",
+    "https://elevenlabs.io/docs/api-reference/speech-to-text/convert"
+  ]
+}
