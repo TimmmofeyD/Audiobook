@@ -104,6 +104,12 @@ def create_app(settings: Settings | None = None):
     @app.delete('/api/books/{book_id}')
     async def delete_book(book_id: str):
         studio.require('book',book_id)
+        # Refuse deletion while background work is running or queued for this book.
+        if book_id in studio.mutating_books:
+            raise HTTPException(409,'Для этой книги выполняется задание. Дождитесь завершения.')
+        active=[j for j in studio.repo.list('job',book_id) if j['status'] in ('QUEUED','RUNNING')]
+        if active:
+            raise HTTPException(409,'Для этой книги уже выполняется задание. Дождитесь завершения.')
         studio.delete_book(book_id)
         return {'deleted':book_id}
 
@@ -318,6 +324,15 @@ def create_app(settings: Settings | None = None):
     @app.get('/api/jobs/{job_id}')
     async def job_detail(job_id: str):
         return studio.require('job',job_id)
+
+    @app.post('/api/jobs/{job_id}/cancel')
+    async def job_cancel(job_id: str):
+        job = studio.require('job',job_id)
+        if job.get('status') not in ('QUEUED','RUNNING'):
+            raise HTTPException(409,'Задача уже завершена')
+        job.update(status='CANCELLED',message='Отменено пользователем',error=None)
+        studio.repo.put('job',job)
+        return job
 
     @app.post('/api/jobs/{job_id}/retry',status_code=202)
     async def job_retry(job_id: str):

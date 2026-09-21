@@ -378,9 +378,17 @@ class AnalysisPipeline:
             if existing is None:
                 evidence_text = _key("\n".join(known_texts[ref] for ref in item.evidence))
                 aliases = [_key(a) for a in [name, *item.aliases]]
-                # Full-name containment OR any significant name token (len>=4)
+                # Confirmation across three mention forms:
+                # 1) full normalized name
+                # 2) any significant token (len>=4) — first name OR surname
+                # 3) name with apostrophes/hyphens already stripped by _key
                 tokens = [t for a in aliases for t in a.split() if len(t) >= 4]
-                if not (any(a in evidence_text for a in aliases) or any(t in evidence_text for t in tokens)):
+                confirmed = (
+                    any(a in evidence_text for a in aliases)
+                    or any(t in evidence_text for t in tokens)
+                    or any(a.replace(" ", "") in evidence_text.replace(" ", "") for a in aliases)
+                )
+                if not confirmed:
                     raise ValueError("Имя нового персонажа не подтверждено исходным текстом")
                 # A new entity may not steal another canonical name or an alias.
                 labels = {_key(name), *(_key(alias) for alias in item.aliases)}

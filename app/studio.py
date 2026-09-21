@@ -380,10 +380,18 @@ class Studio:
         return {'language':'ru','baseline_delivery':base,'gender':g,'age_band':a,
                 'character_name':name,'customized':True}
 
+    def _subjob(self, kind, book_id, target_id, payload=None):
+        """Create a job record for pipeline sub-steps without queue checks."""
+        j={'id':uid(),'book_id':book_id,'kind':kind,'target_id':target_id,
+           'payload':payload or {},'status':'RUNNING','progress':0,'message':'',
+           'error':None,'created_at':now(),'progress_detail':{},
+           'parent_id':None,'attempts':1,'max_attempts':self.settings.max_attempts}
+        return j
+
     async def book_pipeline(self, job):
         """One-click audiobook pipeline: analyze -> wiki -> direct -> cast -> generate."""
         book_id = job['book_id']
-        target_chapter_id = job.get('payload',{}).get('chapter_id')
+        target_chapter_id = (job.get('payload') or {}).get('chapter_id')
         book = self.require('book',book_id)
         chapters = self.repo.list('chapter',book_id)
         # Stage 1: analyze every chapter with persistent Character Bible
@@ -392,17 +400,32 @@ class Studio:
             self.progress(job,0.02+0.35*(i/max(1,len(chapters))),
                 f'Анализ глав: {i+1}/{len(chapters)}',
                 {'stage':1,'stages':5,'stage_name':'Анализ книги','current_chapter':ch['title']})
-            aj = self.enqueue('analyze',book_id,ch['id'],{'chapter_id':ch['id']})
-            aj['status']='RUNNING'
-            try:
-                await self.analyze(aj)
-            except Exception:
-                # Chapter failures do not abort the pipeline
-                aj['status']='FAILED'
+            aj = self._subjob('analyze',book_id,ch['id'],{'chapter_id':ch['id']})
+            # Up to 3 attempts per chapter; LLM output varies between tries.
+            chapter_error = None
+            for attempt in range(1, 4):
+                aj = self._subjob('analyze',book_id,ch['id'],{'chapter_id':ch['id'],'attempt':attempt})
+                aj['status']='RUNNING'
                 self.repo.put('job',aj)
+                try:
+                    await self.analyze(aj)
+                    aj['status']='COMPLETED'
+                    self.repo.put('job',aj)
+                    chapter_error = None
+                    break
+                except Exception as exc:
+                    chapter_error = str(exc)[:400]
+                    aj['status']='FAILED'
+                    aj['error']=chapter_error
+                    self.repo.put('job',aj)
+                    if attempt < 3:
+                        await asyncio.sleep(3 * attempt)
+            if chapter_error is not None:
+                raise ValueError(f'Анализ главы {i+1} не выполнен за 3 попытки: {chapter_error}')
+            await asyncio.sleep(2)
         # Stage 2: wiki research for all characters
         self.progress(job,0.40,'Этап 2: вики-исследование персонажей')
-        chars = self.repo.list('character',book_id)
+        chars = [c for c in self.repo.list('character',book_id) if isinstance(c,dict) and c.get('id')]
         for i,c in enumerate(chars):
             self.progress(job,0.40+0.08*(i/max(1,len(chars))),f'Вики: {i+1}/{len(chars)}',
                 {'stage':2,'stages':5,'stage_name':'Вики-исследование'})
@@ -417,43 +440,53 @@ class Studio:
             idx = next((i for i,c in enumerate(chapters) if c['id']==target_chapter_id), None)
             if idx is not None:
                 target = chapters[:idx+1]
-        scenes = self.repo.list('scene',book_id)
+        scenes = [sc for sc in self.repo.list('scene',book_id) if isinstance(sc,dict) and sc.get('chapter_id')]
         scene_targets = [sc for sc in scenes if any(sc['chapter_id']==c['id'] for c in target)]
         for i,sc in enumerate(scene_targets):
             self.progress(job,0.50+0.20*(i/max(1,len(scene_targets))),
                 f'Режиссура: {i+1}/{len(scene_targets)}',
                 {'stage':3,'stages':5,'stage_name':'Режиссура'})
-            dj = self.enqueue('direct',book_id,sc['id'])
+            dj = self._subjob('direct',book_id,sc['id'])
             dj['status']='RUNNING'
+            self.repo.put('job',dj)
             try:
                 await self.direct(dj)
+                dj['status']='COMPLETED'
+                self.repo.put('job',dj)
             except Exception:
                 dj['status']='FAILED'
                 self.repo.put('job',dj)
         # Stage 4: casting (voice brief + 3 candidates via LLM+TTS then auto-lock best)
         self.progress(job,0.72,'Этап 4: генерация голосов (3 варианта на персонажа)')
-        chars = self.repo.list('character',book_id)
+        chars = [c for c in self.repo.list('character',book_id) if isinstance(c,dict) and c.get('id')]
         for i,c in enumerate(chars):
             self.progress(job,0.72+0.10*(i/max(1,len(chars))),f'Голоса: {i+1}/{len(chars)}',
                 {'stage':4,'stages':5,'stage_name':'Кастинг голосов'})
-            if c.get('voice',{}).get('status')=='LOCKED':
+            if not c.get('voice') or c.get('voice',{}).get('status')=='LOCKED':
                 continue
+            cj = self._subjob('casting',book_id,c['id'])
+            cj['status']='RUNNING'
+            self.repo.put('job',cj)
             try:
-                cj = self.enqueue('casting',book_id,c['id'])
-                cj['status']='RUNNING'
                 await self.casting(cj)
+                cj['status']='COMPLETED'
+                self.repo.put('job',cj)
             except Exception:
-                continue
+                cj['status']='FAILED'
+                self.repo.put('job',cj)
         # Stage 5: generate preview+audio for target scenes
         self.progress(job,0.85,'Этап 5: озвучка глав')
         for i,sc in enumerate(scene_targets):
             self.progress(job,0.85+0.14*(i/max(1,len(scene_targets))),
                 f'Озвучка: {i+1}/{len(scene_targets)}',
                 {'stage':5,'stages':5,'stage_name':'Озвучка'})
-            gj = self.enqueue('preview',book_id,sc['id'])
+            gj = self._subjob('preview',book_id,sc['id'])
             gj['status']='RUNNING'
+            self.repo.put('job',gj)
             try:
                 await self.generate(gj)
+                gj['status']='COMPLETED'
+                self.repo.put('job',gj)
             except Exception:
                 gj['status']='FAILED'
                 self.repo.put('job',gj)
@@ -465,7 +498,7 @@ class Studio:
         book_id = job['book_id']
         book = self.require('book',book_id)
         scenes = self.repo.list('scene',book_id)
-        chapter_id = job.get('payload',{}).get('chapter_id')
+        chapter_id = (job.get('payload') or {}).get('chapter_id')
         if chapter_id:
             chapter = self.require('chapter',chapter_id)
             if chapter['book_id'] != book_id:
